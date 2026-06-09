@@ -9,6 +9,12 @@ We are currently collecting feedback to help improve this work. A major v2.0 rel
 
 Please share your suggestions and comments through the following form: [Feedback Form](https://forms.gle/wQ8Ypw2x2kUb18XVA)
 
+## Known Issue: Bad UAV Spawn Cases
+
+Some users have reported that certain UAV-ON 1.0 episodes contain bad UAV spawn cases, where the initial UAV position may be too close to obstacles or unsuitable for stable navigation. This limitation was not fully considered during the initial benchmark construction.
+
+To mitigate this issue, we recommend adjusting the UAV initial spawn position by increasing its z-axis altitude. This fix can help avoid problematic spawn locations and improve the stability of benchmark evaluation.
+
 ## Content
 
 - [Introduction](#introduction)
