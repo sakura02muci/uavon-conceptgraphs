@@ -5,6 +5,19 @@ import argparse
 from common.param import args
 
 
+class AirsimActions(Enum):
+    """AirSim action enumeration"""
+    FORWARD = 0
+    BACKWARD = 1
+    LEFT = 2
+    RIGHT = 3
+    UP = 4
+    DOWN = 5
+    TURN_LEFT = 6
+    TURN_RIGHT = 7
+    STOP = 8
+
+
 class Singleton(type):
     _instances: Dict["Singleton", "Singleton"] = {}
 

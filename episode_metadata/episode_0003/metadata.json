@@ -1,0 +1,27 @@
+{
+  "episode_id": "3",
+  "map_name": "Barnyard_test",
+  "object_name": " TrafficLight",
+  "description": " Geometric vertical structure, dark green metallic texture with signal lights, three stacked circular lenses in standard red-yellow-green arrangement, used for controlling vehicle and pedestrian traffic.",
+  "start_pose": {
+    "start_position": [
+      17.373067098314493,
+      -115.84122390414761,
+      -10.0
+    ],
+    "start_quaternionr": [
+      0.0,
+      0.0,
+      0.9570623530667257,
+      -0.28988213525911194
+    ]
+  },
+  "object_position": [
+    [
+      -4.092743873596191,
+      -67.59274291992188,
+      -2.9712743759155273
+    ]
+  ],
+  "distance_to_target": 52.9616
+}

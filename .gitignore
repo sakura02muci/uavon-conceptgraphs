@@ -24,3 +24,24 @@ method/
 # Optional: Ignore logs or temp files
 *.log
 *.jsonl
+# Secrets: keep templates, never commit real credentials
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Large local models and generated evaluation artifacts
+checkpoints/
+results/
+airsim_collected/
+baseline_test_results/
+report_assets/
+scene_graph_goal_directed_ep0_visualizations/
+
+# Model weights and media
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.mp4
+*.gif

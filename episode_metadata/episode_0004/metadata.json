@@ -1,0 +1,27 @@
+{
+  "episode_id": "4",
+  "map_name": "Barnyard_test",
+  "object_name": " SoccerBall",
+  "description": " Spherical shape, white surface with black pentagonal panels, classic stitched design, used for playing soccer.",
+  "start_pose": {
+    "start_position": [
+      -71.553313825697,
+      -270.2560004934115,
+      -10.0
+    ],
+    "start_quaternionr": [
+      0.0,
+      0.0,
+      0.6485648548003095,
+      0.761159397969869
+    ]
+  },
+  "object_position": [
+    [
+      -113.69274139404297,
+      -243.89273071289062,
+      3.828725576400757
+    ]
+  ],
+  "distance_to_target": 50.8725
+}

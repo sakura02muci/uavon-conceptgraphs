@@ -1,0 +1,5 @@
+{
+  "dataset_path": "../UAV-ON-dataset/valset/Barnyard.json",
+  "total_episodes": 94,
+  "collected": 5
+}

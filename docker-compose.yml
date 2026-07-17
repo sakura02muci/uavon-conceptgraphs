@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  uavon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: uavon:latest
+    container_name: uavon_container
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+    volumes:
+      - ./:/workspace/UAV_ON
+      - ../UAV-ON-dataset:/workspace/UAV-ON-dataset
+      - ../TRAIN_ENVS:/workspace/TRAIN_ENVS
+      - ../TEST_ENVS:/workspace/TEST_ENVS
+    shm_size: '16gb'
+    stdin_open: true
+    tty: true
+    network_mode: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -1,0 +1,27 @@
+{
+  "episode_id": "0",
+  "map_name": "Barnyard_test",
+  "object_name": " BusStop",
+  "description": " Geometric rectangular structure, transparent glass walls with dark metal framing, includes bench seating and overhanging roof panels, designed for public transit waiting area.",
+  "start_pose": {
+    "start_position": [
+      -282.7460905487492,
+      -107.54151603053101,
+      -10.0
+    ],
+    "start_quaternionr": [
+      0.0,
+      0.0,
+      0.27740825294681576,
+      -0.9607521330691884
+    ]
+  },
+  "object_position": [
+    [
+      -328.3927307128906,
+      -86.79273986816406,
+      0.6287254095077515
+    ]
+  ],
+  "distance_to_target": 50.7181
+}
