@@ -34,6 +34,25 @@ from conceptgraphs_uav.sam_segmenter import SAMSegmenter
 SUCCESS_DISTANCE_METERS = 5.0
 TARGET_CONTACT_SUCCESS_MARGIN_METERS = 0.75
 CAMERA_FOV_DEGREES = 90.0
+# A target crop must beat the negative prompts by a small but positive margin
+# before it is allowed to create a direct navigation waypoint.  In particular,
+# do not let a repeated ``provisional`` box steer the UAV after a collision.
+MIN_TARGET_NAVIGATION_MARGIN = 0.006
+POST_COLLISION_TARGET_MARGIN = 0.015
+POST_COLLISION_TARGET_COOLDOWN_STEPS = 10
+MEDIUM_VISUAL_SERVO_MAX_ACTIONS = 4
+FAR_TARGET_MIN_MARGIN = 0.012
+FAR_TARGET_MAX_ADVANCE_ACTIONS = 3
+# A target is allowed to influence the persistent object graph only after
+# several semantically positive, geometrically stable observations.  This is
+# intentionally stricter than the 2-D visual-servo gate used for re-observing
+# a nearby candidate.
+TARGET_GRAPH_CONFIRMATION_OBSERVATIONS = 3
+TARGET_GRAPH_CONFIRMATION_MARGIN = 0.006
+TARGET_TRACK_MAX_WORLD_DELTA_M = 6.0
+TARGET_GRAPH_PROGRESS_MARGIN_M = 0.60
+TARGET_GRAPH_MAX_STALLED_STEPS = 10
+TARGET_GRAPH_APPROACH_STANDOFF_M = 2.5
 
 
 class EpisodeResetError(RuntimeError):
@@ -114,6 +133,28 @@ def warm_up_rendering(client, frame_count: int, delay_seconds: float) -> list[fl
     finally:
         client.simPause(True)
     return ratios
+
+
+def render_quality_summary(ratios: list[float], window: int = 12) -> dict:
+    """Summarise the settled tail of render warm-up samples."""
+    tail = [float(value) for value in ratios[-max(1, window):]]
+    if not tail:
+        return {"samples": 0, "tail_mean": 1.0, "tail_max": 1.0, "tail_spread": 1.0}
+    return {
+        "samples": len(tail),
+        "tail_mean": float(np.mean(tail)),
+        "tail_max": float(max(tail)),
+        "tail_spread": float(max(tail) - min(tail)),
+    }
+
+
+def render_quality_is_acceptable(summary: dict, max_black_ratio: float, max_spread: float) -> bool:
+    return bool(
+        summary.get("samples", 0) >= 4
+        and float(summary.get("tail_mean", 1.0)) <= max_black_ratio
+        and float(summary.get("tail_max", 1.0)) <= max_black_ratio
+        and float(summary.get("tail_spread", 1.0)) <= max_spread
+    )
 
 
 def collision_info_to_dict(collision_info) -> dict:
@@ -338,10 +379,16 @@ def clear_navigation_memory_after_collision(state: dict, nav_target, collision_r
     state["last_collision_object"] = collided_object
     state["subgoal"] = None
     state["last_plan_step"] = -10_000
+    # The prior lock may have been supported by background pixels from the
+    # collision corridor.  Do not let a weak, newly detected target box
+    # immediately replace it while the vehicle is escaping that corridor.
+    state["target_candidate_cooldown_until"] = step + POST_COLLISION_TARGET_COOLDOWN_STEPS
     state.pop("target_candidate_lock", None)
     state.pop("target_lock_subgoal", None)
     state.pop("target_lock_node", None)
     state.pop("target_lock_node_id", None)
+    state.pop("target_lock_best_distance", None)
+    state.pop("target_lock_stalled_steps", None)
 
     rejected_regions = list(state.get("rejected_subgoal_regions", []))
     rejected_center = nav_target_subgoal_array(nav_target)
@@ -395,6 +442,8 @@ def reject_collided_graph_node(state: dict, nav_target, collision_record: dict, 
         state.pop("target_lock_subgoal", None)
         state.pop("target_lock_node", None)
         state.pop("target_lock_node_id", None)
+        state.pop("target_lock_best_distance", None)
+        state.pop("target_lock_stalled_steps", None)
     state.pop("target_candidate_lock", None)
     nav_target["collision_rejected_node_id"] = str(node_id)
 
@@ -572,7 +621,10 @@ def target_observation_lifecycle(
             and area >= 0.0040
             and float(getattr(det, "confidence", 0.0)) >= 0.30
             and evidence.get("status") == "verified"
-            and float(evidence.get("target_margin") or -1e9) >= 0.015
+            # Far crops are bearings, not depth waypoints. Keep a small
+            # hysteresis margin so numerical CLIP jitter (e.g. 0.0149 vs
+            # 0.0150) does not erase a repeatedly visible distant target.
+            and float(evidence.get("target_margin") or -1e9) >= FAR_TARGET_MIN_MARGIN
         )
         if not strong_far_object:
             return "far_cue"
@@ -869,10 +921,93 @@ def summarize_target_candidates(
             "clip_predictions": evidence.get("generic_predictions", []),
             "semantic_status": evidence.get("status"),
             "target_lifecycle": evidence.get("target_lifecycle", "provisional"),
+            "cross_frame_observations": int(evidence.get("cross_frame_observations", 0)),
+            "cross_frame_consistent": bool(evidence.get("cross_frame_consistent", False)),
+            "cross_frame_semantic_consistent": bool(evidence.get("cross_frame_semantic_consistent", False)),
+            "cross_frame_geometry_consistent": bool(evidence.get("cross_frame_geometry_consistent", False)),
+            "cross_frame_world_delta_m": evidence.get("cross_frame_world_delta_m"),
             "accepted_for_graph": is_graph_detection(det, image_shape, target_name),
         })
     records.sort(key=lambda item: (-item["confidence"], item["projected_distance_to_goal"] or 1e9))
     return records[:top_k]
+
+
+def update_cross_frame_target_track(
+    state: dict,
+    detections,
+    evidence_cache: dict[int, dict],
+    image_shape: tuple[int, int],
+    step: int,
+    depth: np.ndarray | None = None,
+    position: np.ndarray | None = None,
+    orientation: np.ndarray | None = None,
+) -> None:
+    """Accumulate semantic belief only across consistent 2-D and 3-D evidence.
+
+    Image-space continuity prevents abrupt prompt hallucinations from becoming
+    a track; world-space agreement prevents a drifting depth projection from
+    being promoted to a navigation graph node.  The 3-D centroid is used here
+    only as a *consistency check*, never as a single-frame waypoint authority.
+    """
+    height, width = image_shape[:2]
+    candidates = []
+    for det in detections:
+        evidence = evidence_cache.get(id(det), {})
+        evidence["cross_frame_observations"] = 0
+        evidence["cross_frame_consistent"] = False
+        evidence["cross_frame_semantic_consistent"] = False
+        evidence["cross_frame_geometry_consistent"] = False
+        evidence["cross_frame_world_delta_m"] = None
+        if is_far_target_evidence(evidence):
+            continue
+        if evidence.get("status") != "verified":
+            continue
+        x1, y1, x2, y2 = [float(value) for value in det.bbox_xyxy]
+        area = bbox_area_ratio(det.bbox_xyxy, image_shape)
+        center = np.asarray([(x1 + x2) * 0.5 / width, (y1 + y2) * 0.5 / height], dtype=np.float32)
+        world_centroid = None
+        if depth is not None and position is not None and orientation is not None:
+            points = project_depth_bbox_to_world(
+                depth=depth,
+                bbox_xyxy=np.asarray(det.bbox_xyxy, dtype=np.float32),
+                position=np.asarray(position, dtype=np.float32),
+                quaternion_xyzw=np.asarray(orientation, dtype=np.float32),
+                fov_degrees=CAMERA_FOV_DEGREES,
+                stride=2,
+                max_depth=80.0,
+            )
+            if len(points):
+                world_centroid = np.median(points, axis=0)
+        score = float(evidence.get("target_margin") or -1e9) + 0.03 * float(det.confidence)
+        candidates.append((score, det, evidence, center, area, world_centroid))
+    if not candidates:
+        return
+    _, det, evidence, center, area, world_centroid = max(candidates, key=lambda item: item[0])
+    previous = state.get("track") if isinstance(state, dict) else None
+    observations = 1
+    geometry_consistent = False
+    world_delta = None
+    if isinstance(previous, dict) and step - int(previous.get("step", -9999)) <= 3:
+        previous_center = np.asarray(previous.get("center", []), dtype=np.float32)
+        previous_area = float(previous.get("area", 0.0))
+        center_delta = float(np.linalg.norm(center - previous_center)) if previous_center.shape == (2,) else float("inf")
+        area_ratio = area / max(previous_area, 1e-5)
+        previous_world = np.asarray(previous.get("world_centroid", []), dtype=np.float32)
+        if world_centroid is not None and previous_world.shape == (3,):
+            world_delta = float(np.linalg.norm(world_centroid - previous_world))
+            geometry_consistent = world_delta <= TARGET_TRACK_MAX_WORLD_DELTA_M
+        if center_delta <= 0.22 and 0.25 <= area_ratio <= 4.0 and geometry_consistent:
+            observations = int(previous.get("observations", 1)) + 1
+    state["track"] = {
+        "step": int(step), "center": center.round(4).tolist(), "area": float(area),
+        "observations": int(observations),
+        "world_centroid": world_centroid.round(3).tolist() if world_centroid is not None else None,
+    }
+    evidence["cross_frame_observations"] = int(observations)
+    evidence["cross_frame_semantic_consistent"] = True
+    evidence["cross_frame_geometry_consistent"] = bool(geometry_consistent)
+    evidence["cross_frame_world_delta_m"] = round(world_delta, 3) if world_delta is not None else None
+    evidence["cross_frame_consistent"] = bool(observations >= TARGET_GRAPH_CONFIRMATION_OBSERVATIONS)
 
 
 def target_candidate_quality(record: dict) -> float:
@@ -881,10 +1016,16 @@ def target_candidate_quality(record: dict) -> float:
         return -1e9
     if record.get("target_lifecycle") == "far_cue":
         return -1e9
+    if not record.get("cross_frame_consistent", False):
+        return -1e9
     confidence = float(record.get("confidence") or 0.0)
     area = float(record.get("bbox_area_ratio") or 0.0)
     margin = float(record.get("clip_target_margin") or 0.0)
     status = record.get("semantic_status")
+    # A provisional crop can provide a coarse exploration waypoint, but it
+    # cannot activate the final close-range controller below. This preserves
+    # recall when the target is distant while preventing weak crops from
+    # taking over the final metres after a collision.
     if status == "verified":
         semantic_penalty = 0.0
     elif status == "provisional" and margin >= -0.006:
@@ -897,6 +1038,21 @@ def target_candidate_quality(record: dict) -> float:
     # prompt hallucinations dominate.  CLIP margin remains the main semantic cue.
     area_bonus = min(area, 0.025) * 2.0
     return float(margin + 0.03 * confidence + area_bonus - semantic_penalty)
+
+
+def target_candidate_evidence_level(record: dict) -> str:
+    """Classify a usable target crop by the control authority it earns.
+
+    Medium evidence is deliberately useful for *2-D re-observation*, but never
+    for a depth-projected waypoint.  This separates the recall needed for
+    distant UAV targets from the precision needed for the final metres.
+    """
+    if target_candidate_quality(record) <= -1e8:
+        return "none"
+    margin = float(record.get("clip_target_margin") or -1e9)
+    if record.get("semantic_status") == "verified" and margin >= MIN_TARGET_NAVIGATION_MARGIN:
+        return "strong"
+    return "medium"
 
 
 def best_target_candidate(target_candidates: list[dict]) -> dict | None:
@@ -956,6 +1112,29 @@ def update_target_candidate_lock(
     """
     lock = state.get("target_candidate_lock")
     scored_candidates = scored_target_candidates(target_candidates)
+    rejected_regions = state.get("rejected_subgoal_regions", [])
+    cooldown_until = int(state.get("target_candidate_cooldown_until", -1))
+    filtered_candidates = []
+    rejected_count = 0
+    cooldown_count = 0
+    for score, candidate in scored_candidates:
+        centroid = navigation_subgoal_from_target_candidate(candidate)
+        if point_in_rejected_region(centroid, rejected_regions) is not None:
+            rejected_count += 1
+            continue
+        # Immediately after an obstacle collision, require stronger-than-usual
+        # semantic evidence before a fresh direct waypoint can take control.
+        if step <= cooldown_until and float(candidate.get("clip_target_margin") or -1e9) < POST_COLLISION_TARGET_MARGIN:
+            cooldown_count += 1
+            continue
+        filtered_candidates.append((score, candidate))
+    scored_candidates = filtered_candidates
+    state["target_candidate_filter"] = {
+        "step": int(step),
+        "rejected_region_candidates": int(rejected_count),
+        "cooldown_rejected_candidates": int(cooldown_count),
+        "cooldown_until": int(cooldown_until),
+    }
     record = None
     if isinstance(lock, dict) and lock.get("subgoal") is not None:
         previous = np.asarray(lock["subgoal"], dtype=np.float32)
@@ -1033,16 +1212,79 @@ def update_target_candidate_lock(
         "candidate": record,
         "distance_from_uav": round(distance_from_uav, 3),
     }
+    evidence_level = target_candidate_evidence_level(record)
+    new_lock["evidence_level"] = evidence_level
     state["target_candidate_lock"] = new_lock
+    if evidence_level == "medium":
+        # Do not return this depth-projected location as a navigation target.
+        # It is made available only to the bounded image-plane controller.
+        state["medium_target_visual"] = new_lock
+        return None, new_lock
+    state.pop("medium_target_visual", None)
     if observations >= 2 or strong_single_frame:
         return smoothed, new_lock
     return None, None
 
 
-def find_target_node(scene_graph, target_name: str, position: np.ndarray, rejected_node_ids: set[str] | None = None) -> tuple[np.ndarray | None, dict | None]:
+def run_medium_target_visual_servo(
+    candidate_lock: dict | None,
+    image_width: int,
+    state: dict,
+    step: int,
+) -> tuple[str, float, str, dict] | None:
+    """Use bounded 2-D steering for a medium-confidence current target crop.
+
+    No projected depth or graph node is used here. After a few actions the
+    policy yields to graph/frontier planning, forcing a fresh observation
+    instead of drifting indefinitely toward a background-depth hypothesis.
+    """
+    if not isinstance(candidate_lock, dict) or candidate_lock.get("evidence_level") != "medium":
+        state["medium_visual_servo_steps"] = 0
+        return None
+    candidate = candidate_lock.get("candidate")
+    if not isinstance(candidate, dict):
+        return None
+    bbox = candidate.get("bbox_xyxy")
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return None
+    x1, _, x2, _ = [float(value) for value in bbox]
+    if x1 <= 2.0 or x2 >= float(image_width) - 2.0:
+        return None
+    used = int(state.get("medium_visual_servo_steps", 0))
+    if used >= MEDIUM_VISUAL_SERVO_MAX_ACTIONS:
+        state["medium_visual_servo_steps"] = 0
+        state["medium_visual_servo_cooldown_until"] = int(step) + 2
+        return None
+    if int(step) <= int(state.get("medium_visual_servo_cooldown_until", -1)):
+        return None
+
+    center_x = 0.5 * (x1 + x2)
+    normalized_error = (float(image_width) * 0.5 - center_x) / max(float(image_width) * 0.5, 1.0)
+    angle_error = float(np.radians(CAMERA_FOV_DEGREES * 0.5 * normalized_error))
+    state["medium_visual_servo_steps"] = used + 1
+    detail = {
+        "target_bbox": candidate,
+        "evidence_level": "medium",
+        "visual_servo_step": used + 1,
+        "visual_servo_limit": MEDIUM_VISUAL_SERVO_MAX_ACTIONS,
+        "reason": "bounded_2d_reobservation_no_depth_waypoint",
+    }
+    if abs(float(np.degrees(angle_error))) > 12.0:
+        return "turn_to_goal", angle_error, "medium_target_visual_turn", detail
+    return "forward_slow", angle_error, "medium_target_visual_forward", detail
+
+
+def find_target_node(
+    scene_graph,
+    target_name: str,
+    position: np.ndarray,
+    rejected_node_ids: set[str] | None = None,
+    rejected_regions: list[dict] | None = None,
+) -> tuple[np.ndarray | None, dict | None]:
     """Pick the best target-like node from the current scene graph."""
     candidates = []
     rejected_node_ids = rejected_node_ids or set()
+    rejected_regions = rejected_regions or []
     for node_id, node in scene_graph.graph.nodes(data=True):
         if str(node_id) in rejected_node_ids:
             continue
@@ -1051,6 +1293,8 @@ def find_target_node(scene_graph, target_name: str, position: np.ndarray, reject
         if not node_is_confirmed(node):
             continue
         centroid = np.asarray(node["centroid"], dtype=np.float32)
+        if point_in_rejected_region(centroid, rejected_regions) is not None:
+            continue
         metadata = node.get("metadata", {}) if isinstance(node, dict) else {}
         is_oracle = isinstance(metadata, dict) and metadata.get("detector") == "oracle_graph_bootstrap"
         semantic_evidence = metadata.get("semantic_evidence", {}) if isinstance(metadata, dict) else {}
@@ -1243,6 +1487,8 @@ def reject_reached_semantic_subgoal(state: dict, nav_target, radius: float = 8.0
     state.pop("target_lock_subgoal", None)
     state.pop("target_lock_node", None)
     state.pop("target_lock_node_id", None)
+    state.pop("target_lock_best_distance", None)
+    state.pop("target_lock_stalled_steps", None)
     return record
 
 
@@ -1405,8 +1651,17 @@ def navigation_subgoal_from_node(centroid: np.ndarray, approach_z: float = 0.0) 
     return subgoal
 
 
-def navigation_subgoal_for_target_node(node: dict, centroid: np.ndarray) -> np.ndarray:
-    """Choose a navigation target from a semantic graph node."""
+def navigation_subgoal_for_target_node(
+    node: dict,
+    centroid: np.ndarray,
+    position: np.ndarray | None = None,
+) -> np.ndarray:
+    """Choose a safe standoff waypoint for a semantic graph node.
+
+    A real object goal is considered reached within five metres.  Approaching a
+    stable node to a small standoff is safer than commanding the depth-derived
+    centroid itself and avoids collisions with the object or its support.
+    """
     metadata = node.get("metadata", {}) if isinstance(node, dict) else {}
     if isinstance(metadata, dict) and metadata.get("detector") == "oracle_graph_bootstrap":
         return np.asarray(centroid, dtype=np.float32)
@@ -1414,9 +1669,14 @@ def navigation_subgoal_for_target_node(node: dict, centroid: np.ndarray) -> np.n
     observations = int(node.get("observations", 1)) if isinstance(node, dict) else 1
     confidence = float(node.get("confidence", 0.0)) if isinstance(node, dict) else 0.0
     z_is_plausible = -2.0 <= float(centroid[2]) <= 8.0
-    if observations >= 3 and confidence >= 0.30 and z_is_plausible:
-        return centroid.copy()
-    return navigation_subgoal_from_node(centroid)
+    subgoal = centroid.copy() if observations >= 3 and confidence >= 0.30 and z_is_plausible else navigation_subgoal_from_node(centroid)
+    if position is not None and not is_oracle_graph_node(node):
+        position = np.asarray(position, dtype=np.float32)
+        offset = subgoal[:2] - position[:2]
+        distance = float(np.linalg.norm(offset))
+        if distance > TARGET_GRAPH_APPROACH_STANDOFF_M:
+            subgoal[:2] -= offset / distance * TARGET_GRAPH_APPROACH_STANDOFF_M
+    return subgoal
 
 
 def is_oracle_graph_node(node: dict | None) -> bool:
@@ -1475,7 +1735,26 @@ def choose_hierarchical_action(
         candidate_subgoal, candidate_lock = update_target_candidate_lock(
             state, target_candidates, position, step
         )
-    target_centroid, target_node = find_target_node(graph_builder.scene_graph, target_name, position, rejected_node_ids)
+    target_centroid, target_node = find_target_node(
+        graph_builder.scene_graph,
+        target_name,
+        position,
+        rejected_node_ids,
+        state.get("rejected_subgoal_regions", []),
+    )
+    # A confirmed node can disappear from the current frame while the UAV
+    # turns or the detector misses it. Keep its world-space belief active until
+    # it is reached, collides, or demonstrably stops making progress.
+    if target_centroid is None and not force_planner:
+        locked_node = state.get("target_lock_node")
+        locked_node_id = state.get("target_lock_node_id")
+        if isinstance(locked_node, dict) and str(locked_node_id) not in rejected_node_ids:
+            try:
+                locked_centroid = np.asarray(locked_node["centroid"], dtype=np.float32)
+                if point_in_rejected_region(locked_centroid, state.get("rejected_subgoal_regions", [])) is None:
+                    target_centroid, target_node = locked_centroid, locked_node
+            except (KeyError, TypeError, ValueError):
+                pass
     planner_info = None
     planner_chosen_node = None
 
@@ -1506,7 +1785,13 @@ def choose_hierarchical_action(
             return None
         observations = int(candidate_lock.get("observations", 0))
         distance = float(np.linalg.norm(np.asarray(candidate_subgoal)[:2] - position[:2]))
-        if observations < 2 or distance > 14.0:
+        candidate = candidate_lock.get("candidate", {})
+        strong_current_visual = (
+            isinstance(candidate, dict)
+            and candidate.get("semantic_status") == "verified"
+            and float(candidate.get("clip_target_margin") or -1e9) >= MIN_TARGET_NAVIGATION_MARGIN
+        )
+        if observations < 2 or distance > 14.0 or not strong_current_visual:
             return None
         action, angle_error, executor_info = executor.choose_action(position, yaw, candidate_subgoal, depth)
         state.update({
@@ -1538,24 +1823,74 @@ def choose_hierarchical_action(
     # A far cue contributes only a camera bearing.  It cannot create a 3-D
     # destination or force forward movement while its depth is unreliable.
     far_error, far_det = bbox_steering_error(far_target_detections, target_name, image_width)
-    far_turns = int(state.get("far_cue_turns", 0))
-    if far_error is not None and abs(np.degrees(far_error)) > 16.0 and far_turns < 2:
-        state["far_cue_turns"] = far_turns + 1
-        return "turn_to_goal", far_error, "far_target_bearing_turn", {
+    # A confirmed graph object is a world-space target and takes precedence
+    # over a raw far-frame bearing. Otherwise a persistent 2-D box can keep
+    # returning before the graph branch below ever receives control.
+    if target_centroid is None and far_error is not None:
+        far_detail = {
             "target_bbox": far_det,
             "target_lifecycle": "far_cue",
-            "reason": "far_target_bearing_only",
+            "reason": "far_target_bearing_only_no_depth_waypoint",
         }
-    state["far_cue_turns"] = 0
+        if abs(np.degrees(far_error)) > 16.0:
+            state["far_target_advance_actions"] = 0
+            return "turn_to_goal", far_error, "far_target_bearing_turn", far_detail
+        advance_actions = int(state.get("far_target_advance_actions", 0))
+        cooldown_until = int(state.get("far_target_advance_cooldown_until", -1))
+        if advance_actions < FAR_TARGET_MAX_ADVANCE_ACTIONS and step > cooldown_until:
+            state["far_target_advance_actions"] = advance_actions + 1
+            return "forward_slow", far_error, "far_target_bearing_advance", {
+                **far_detail,
+                "advance_action": advance_actions + 1,
+                "advance_limit": FAR_TARGET_MAX_ADVANCE_ACTIONS,
+            }
+        # A short burst has been completed. Yield two observations to normal
+        # planning before another burst, rather than following an unreliable
+        # far detection indefinitely.
+        if advance_actions >= FAR_TARGET_MAX_ADVANCE_ACTIONS:
+            state["far_target_advance_actions"] = 0
+            state["far_target_advance_cooldown_until"] = int(step) + 2
+    else:
+        state["far_target_advance_actions"] = 0
 
     if target_centroid is not None and not force_planner:
-        subgoal = navigation_subgoal_for_target_node(target_node, target_centroid)
+        node_id = target_node.get("node_id") if isinstance(target_node, dict) else None
+        node_distance = float(np.linalg.norm(np.asarray(target_centroid)[:2] - position[:2]))
+        if node_id:
+            prior_lock_id = state.get("target_lock_node_id")
+            best_distance = float(state.get("target_lock_best_distance", float("inf")))
+            stalled_steps = int(state.get("target_lock_stalled_steps", 0))
+            if str(prior_lock_id) != str(node_id):
+                best_distance, stalled_steps = node_distance, 0
+            elif node_distance <= best_distance - TARGET_GRAPH_PROGRESS_MARGIN_M:
+                best_distance, stalled_steps = node_distance, 0
+            else:
+                stalled_steps += 1
+            state.update({
+                "target_lock_node": target_node,
+                "target_lock_node_id": str(node_id),
+                "target_lock_best_distance": float(best_distance),
+                "target_lock_stalled_steps": int(stalled_steps),
+            })
+            if stalled_steps >= TARGET_GRAPH_MAX_STALLED_STEPS:
+                rejected_node_ids.add(str(node_id))
+                state["rejected_node_ids"] = sorted(rejected_node_ids)
+                state.pop("target_lock_node", None)
+                state.pop("target_lock_node_id", None)
+                state.pop("target_lock_best_distance", None)
+                state.pop("target_lock_stalled_steps", None)
+                return "rotate_left", 0.0, "target_graph_stalled_reject", {
+                    "target_node": target_node,
+                    "node_distance": round(node_distance, 3),
+                    "stalled_steps": stalled_steps,
+                    "rejected_node_id": str(node_id),
+                }
+        subgoal = navigation_subgoal_for_target_node(target_node, target_centroid, position=position)
         source = "target_graph_subgoal"
         # The waypoint executor uses a comparatively loose reach radius.  Once
         # a confirmed target node is nearby, retain graph guidance but use the
         # current target box for the final few metres instead of declaring the
         # semantic waypoint reached and falling back to exploration.
-        node_distance = float(np.linalg.norm(np.asarray(target_centroid)[:2] - position[:2]))
         visual_error, visual_det = bbox_steering_error(gd_detections, target_name, image_width)
         if node_distance <= 15.0 and visual_error is not None:
             if abs(np.degrees(visual_error)) > 18.0:
@@ -1570,11 +1905,8 @@ def choose_hierarchical_action(
                 "node_distance": round(node_distance, 3),
             }
         state.update({"subgoal": subgoal.tolist(), "source": source, "last_plan_step": step})
-        node_id = target_node.get("node_id") if isinstance(target_node, dict) else None
-        if node_id and target_memory_mode == "aggressive":
+        if node_id:
             state["target_lock_subgoal"] = subgoal.tolist()
-            state["target_lock_node"] = target_node
-            state["target_lock_node_id"] = str(node_id)
         action, angle_error, executor_info = executor.choose_action(position, yaw, subgoal, depth)
         detail = {
             "subgoal": np.asarray(subgoal).round(3).tolist(),
@@ -1602,11 +1934,22 @@ def choose_hierarchical_action(
                     state.pop("target_lock_subgoal", None)
                     state.pop("target_lock_node", None)
                     state.pop("target_lock_node_id", None)
+                    state.pop("target_lock_best_distance", None)
+                    state.pop("target_lock_stalled_steps", None)
                 detail["rejected_node_id"] = str(node_id)
             # Reached a semantic candidate but the episode has not succeeded yet;
             # scan instead of hovering forever on a likely false positive.
             return "rotate_left", 0.0, "target_graph_reached_scan", detail
         return action, angle_error, source, detail
+
+    # No confirmed graph target exists: use medium visual evidence only as a
+    # bounded re-observation controller, never as an override for a mapped
+    # world-space object.
+    medium_visual_result = run_medium_target_visual_servo(
+        candidate_lock, image_width, state, step
+    )
+    if medium_visual_result is not None:
+        return medium_visual_result
 
     if target_memory_mode == "conservative":
         candidate_result = run_candidate_lock()
@@ -2152,7 +2495,7 @@ def choose_conceptgraph_action(
     return "forward", 0.0, "explore_forward", None
 
 
-def evaluate_episode(client, episode, detector, strategy="conceptgraph", max_steps=500, graph_output=None, frames_output=None, detector_name="clip", planner=None, oracle_graph_bootstrap=False, clip_verifier=None, diagnostic_dir=None, force_llm_graph_choice=False, sam_segmenter=None, target_tiled_detection=False, target_tile_grid=2, target_tile_box_threshold=0.20, target_clip_margin=None, max_target_nodes_per_frame=None, target_memory_mode="conservative", safe_step_mode=False, collision_recovery=False, visual_close_approach=False, render_warmup_frames=0, render_warmup_delay=0.2, map_association_threshold=0.62):
+def evaluate_episode(client, episode, detector, strategy="conceptgraph", max_steps=500, graph_output=None, frames_output=None, detector_name="clip", planner=None, oracle_graph_bootstrap=False, clip_verifier=None, diagnostic_dir=None, force_llm_graph_choice=False, sam_segmenter=None, target_tiled_detection=False, target_tile_grid=2, target_tile_box_threshold=0.20, target_clip_margin=None, max_target_nodes_per_frame=None, target_memory_mode="conservative", safe_step_mode=False, collision_recovery=False, visual_close_approach=False, render_warmup_frames=0, render_warmup_delay=0.2, map_association_threshold=0.62, render_quality_max_black_ratio=None, render_quality_max_spread=0.01, render_quality_retry_rounds=0):
     """Evaluate single episode."""
     
     # Episode info
@@ -2240,6 +2583,14 @@ def evaluate_episode(client, episode, detector, strategy="conceptgraph", max_ste
     llm_history = []
     local_executor = LocalWaypointExecutor()
     hierarchical_state = {}
+    target_track_state = {}
+    target_evidence_stats = {
+        "frames_with_target_proposals": 0,
+        "frames_with_semantically_verified_target": 0,
+        "frames_with_geometry_consistent_target": 0,
+        "frames_with_graph_confirmed_target": 0,
+        "persistent_target_detections": 0,
+    }
     clip_active_state = {}
     collision_events = []
     initial_collision = collision_info_to_dict(client.simGetCollisionInfo())
@@ -2258,6 +2609,21 @@ def evaluate_episode(client, episode, detector, strategy="conceptgraph", max_ste
     render_warmup_black_ratios = warm_up_rendering(
         client, int(render_warmup_frames), float(render_warmup_delay)
     )
+    render_quality = render_quality_summary(render_warmup_black_ratios)
+    quality_round = 0
+    while (
+        render_quality_max_black_ratio is not None
+        and not render_quality_is_acceptable(
+            render_quality, float(render_quality_max_black_ratio), float(render_quality_max_spread)
+        )
+        and quality_round < int(render_quality_retry_rounds)
+    ):
+        quality_round += 1
+        extra = warm_up_rendering(
+            client, max(25, int(render_warmup_frames) // 2), float(render_warmup_delay)
+        )
+        render_warmup_black_ratios.extend(extra)
+        render_quality = render_quality_summary(render_warmup_black_ratios)
     if render_warmup_black_ratios:
         print(
             "Render warm-up: "
@@ -2265,6 +2631,32 @@ def evaluate_episode(client, episode, detector, strategy="conceptgraph", max_ste
             f"{100.0 * render_warmup_black_ratios[0]:.2f}% → "
             f"{100.0 * render_warmup_black_ratios[-1]:.2f}%"
         )
+    if (
+        render_quality_max_black_ratio is not None
+        and not render_quality_is_acceptable(
+            render_quality, float(render_quality_max_black_ratio), float(render_quality_max_spread)
+        )
+    ):
+        print(f"⚠️  Render quality rejected: {render_quality}")
+        client.simPause(False)
+        client.landAsync().join()
+        client.armDisarm(False)
+        client.enableApiControl(False)
+        return {
+            'episode_id': episode_id, 'map_name': map_name, 'target': target_name,
+            'object_name': object_name, 'strategy': strategy, 'success': False,
+            'success_reason': 'render_quality_rejected', 'failure_type': 'render_quality_rejected',
+            'render_quality': render_quality, 'render_quality_retry_rounds': quality_round,
+            'render_warmup_frames': int(render_warmup_frames),
+            'render_warmup_near_black_ratios': render_warmup_black_ratios,
+            'spl': 0.0, 'min_distance_to_goal': None, 'path_length': 0.0,
+            'steps': 0, 'frames_collected': 0, 'scene_graph_path': None,
+            'scene_graph_nodes': 0, 'scene_graph_edges': 0, 'trajectory': [],
+            'detections': [], 'collided': False, 'collision_count': 0,
+            'collision_events': [], 'graph_goal_diagnostics': {},
+            'target_evidence_stats': target_evidence_stats,
+            'geodesic_distance': geo_dist, 'euclidean_distance': euc_dist,
+        }
     
     # Navigation loop
     for step in range(max_steps):
@@ -2386,16 +2778,33 @@ def evaluate_episode(client, episode, detector, strategy="conceptgraph", max_ste
                     det, evidence, rgb.shape[:2], projected_range, target_name
                 )
                 evidence_cache[id(det)] = evidence
+            update_cross_frame_target_track(
+                target_track_state, gd_target_detections, evidence_cache, rgb.shape[:2], step,
+                depth=depth, position=position, orientation=orientation,
+            )
+            if gd_target_detections:
+                target_evidence_stats["frames_with_target_proposals"] += 1
+            if any(evidence.get("status") == "verified" for evidence in evidence_cache.values()):
+                target_evidence_stats["frames_with_semantically_verified_target"] += 1
+            if any(evidence.get("cross_frame_geometry_consistent") for evidence in evidence_cache.values()):
+                target_evidence_stats["frames_with_geometry_consistent_target"] += 1
             # Far cues must never be converted into persistent 3-D target
             # nodes; they are retained separately for a bounded bearing turn.
             persistent_target_ids = {
                 id(det) for det in gd_target_detections
                 if not is_far_target_evidence(evidence_cache[id(det)])
+                and bool(evidence_cache[id(det)].get("cross_frame_consistent", False))
+                and bool(evidence_cache[id(det)].get("cross_frame_semantic_consistent", False))
+                and bool(evidence_cache[id(det)].get("cross_frame_geometry_consistent", False))
+                and float(evidence_cache[id(det)].get("target_margin") or -1e9) >= TARGET_GRAPH_CONFIRMATION_MARGIN
             }
             if target_clip_margin is not None:
                 eligible = [
                     det for det in gd_target_detections
                     if not is_far_target_evidence(evidence_cache[id(det)])
+                    and bool(evidence_cache[id(det)].get("cross_frame_consistent", False))
+                    and bool(evidence_cache[id(det)].get("cross_frame_semantic_consistent", False))
+                    and bool(evidence_cache[id(det)].get("cross_frame_geometry_consistent", False))
                     and float(evidence_cache[id(det)].get("target_margin") or -1e9) >= target_clip_margin
                 ]
                 eligible.sort(
@@ -2407,6 +2816,9 @@ def evaluate_episode(client, episode, detector, strategy="conceptgraph", max_ste
                 if max_target_nodes_per_frame is not None:
                     eligible = eligible[:max_target_nodes_per_frame]
                 persistent_target_ids = {id(det) for det in eligible}
+            if persistent_target_ids:
+                target_evidence_stats["frames_with_graph_confirmed_target"] += 1
+                target_evidence_stats["persistent_target_detections"] += len(persistent_target_ids)
             navigation_target_detections = [
                 det for det in gd_target_detections if id(det) in persistent_target_ids
             ]
@@ -2442,7 +2854,9 @@ def evaluate_episode(client, episode, detector, strategy="conceptgraph", max_ste
                         f"DINO label={det.label}; phrase={getattr(det, 'phrase', '')}; "
                         f"confidence={float(det.confidence):.3f}; semantic_status={evidence.get('status')}; "
                         f"lifecycle={evidence.get('target_lifecycle')}; range_m={evidence.get('projected_range_m')}; "
-                        f"CLIP target_margin={evidence.get('target_margin')}; generic_labels={generic_labels}"
+                        f"CLIP target_margin={evidence.get('target_margin')}; "
+                        f"track_observations={evidence.get('cross_frame_observations', 0)}; "
+                        f"generic_labels={generic_labels}"
                     )
                     instance_mask = None
                     if sam_segmenter is not None and label_matches_target(det.label, target_name):
@@ -2677,12 +3091,15 @@ def evaluate_episode(client, episode, detector, strategy="conceptgraph", max_ste
                 "collision_recovery": bool(collision_recovery),
                 "visual_close_approach": bool(visual_close_approach),
                 "target_candidates": target_candidates,
+                "target_evidence_stats": dict(target_evidence_stats),
                 "hierarchical_state_debug": {
                     "subgoal": hierarchical_state.get("subgoal"),
                     "source": hierarchical_state.get("source"),
                     "last_plan_step": hierarchical_state.get("last_plan_step"),
                     "target_candidate_lock": hierarchical_state.get("target_candidate_lock"),
                     "target_lock_node_id": hierarchical_state.get("target_lock_node_id"),
+                    "target_lock_best_distance": hierarchical_state.get("target_lock_best_distance"),
+                    "target_lock_stalled_steps": hierarchical_state.get("target_lock_stalled_steps", 0),
                     "rejected_node_ids": hierarchical_state.get("rejected_node_ids", []),
                     "rejected_subgoal_regions": hierarchical_state.get("rejected_subgoal_regions", []),
                     "collision_recovery_steps": hierarchical_state.get("collision_recovery_steps", 0),
@@ -2795,8 +3212,11 @@ def evaluate_episode(client, episode, detector, strategy="conceptgraph", max_ste
         'visual_close_approach': bool(visual_close_approach),
         'render_warmup_frames': int(render_warmup_frames),
         'render_warmup_near_black_ratios': render_warmup_black_ratios,
+        'render_quality': render_quality,
+        'render_quality_retry_rounds': quality_round,
         'success': success,
         'success_reason': success_reason,
+        'failure_type': None if success else 'max_steps_exceeded',
         'spl': spl,
         'min_distance_to_goal': float(min_distance_to_goal),
         'path_length': float(path_length),
@@ -2811,6 +3231,7 @@ def evaluate_episode(client, episode, detector, strategy="conceptgraph", max_ste
         'collision_count': len(collision_events),
         'collision_events': collision_events,
         'graph_goal_diagnostics': graph_goal_diagnostics,
+        'target_evidence_stats': target_evidence_stats,
         'geodesic_distance': geo_dist,
         'euclidean_distance': euc_dist
     }
@@ -2896,6 +3317,12 @@ def main():
                        help="Request this many scene frames after each reset before mapping begins")
     parser.add_argument("--render-warmup-delay", type=float, default=0.2,
                        help="Seconds between render warm-up frames")
+    parser.add_argument("--render-quality-max-black-ratio", type=float, default=None,
+                       help="Reject an episode if settled render black coverage exceeds this ratio")
+    parser.add_argument("--render-quality-max-spread", type=float, default=0.01,
+                       help="Maximum settled-frame black-ratio spread allowed by render gate")
+    parser.add_argument("--render-quality-retry-rounds", type=int, default=0,
+                       help="Extra warm-up rounds before rejecting an unstable render")
     parser.add_argument("--resume", action="store_true",
                        help="Resume from an existing output JSON, skipping completed episode IDs")
     
@@ -3014,6 +3441,9 @@ def main():
                 render_warmup_frames=args.render_warmup_frames,
                 render_warmup_delay=args.render_warmup_delay,
                 map_association_threshold=args.map_association_threshold,
+                render_quality_max_black_ratio=args.render_quality_max_black_ratio,
+                render_quality_max_spread=args.render_quality_max_spread,
+                render_quality_retry_rounds=max(0, args.render_quality_retry_rounds),
             )
         except EpisodeResetError as exc:
             # Preserve the dataset's strict start-pose contract: do not score a
@@ -3079,8 +3509,14 @@ def main():
         avg_spl = np.mean([r['spl'] for r in results if r['success']])
         print(f"Average SPL (successful): {avg_spl:.3f}")
     
-    avg_min_dist = np.mean([r['min_distance_to_goal'] for r in results])
-    print(f"Average min distance to goal: {avg_min_dist:.2f}m")
+    valid_min_distances = [
+        float(r['min_distance_to_goal']) for r in results
+        if r.get('min_distance_to_goal') is not None
+    ]
+    if valid_min_distances:
+        print(f"Average min distance to goal: {np.mean(valid_min_distances):.2f}m")
+    else:
+        print("Average min distance to goal: unavailable (no navigated episodes)")
     print(f"Scene graphs saved to: {graph_dir}")
     
     print(f"\nResults saved to {args.output}")
